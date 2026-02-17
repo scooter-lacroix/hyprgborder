@@ -39,25 +39,53 @@ The binary lands at:
 zig-out/bin/hyprgborder
 ```
 
+### System Installation
+
+After building, install to `/usr/local/bin`:
+
+```bash
+sudo zig build install -Doptimize=ReleaseFast --prefix /usr/local
+```
+
+Or for a user-local installation:
+
+```bash
+zig build install -Doptimize=ReleaseFast --prefix ~/.local
+```
+
+Make sure `~/.local/bin` is in your PATH.
+
+### Verify Installation
+
+```bash
+hyprgborder --help
+```
+
 ### Quick Start
 
 ```bash
 # Run with saved configuration (or defaults)
-./zig-out/bin/hyprgborder
+hyprgborder
 
 # Open the TUI for interactive configuration
-./zig-out/bin/hyprgborder --tui
+hyprgborder --tui
 
 # Show help
-./zig-out/bin/hyprgborder --help
+hyprgborder --help
 ```
 
 ### Autostart with Hyprland
 
-Enable autostart from the System Settings panel in the TUI, or manually add to your Hyprland config:
+Enable autostart from the System Settings panel in the TUI, or manually add to your Hyprland config (`~/.config/hypr/hyprland.conf`):
 
 ```ini
-exec-once = /path/to/hyprgborder
+exec-once = hyprgborder
+```
+
+**Important**: After enabling autostart, verify the desktop entry was created:
+
+```bash
+ls ~/.config/autostart/hyprgborder.desktop
 ```
 
 ---

@@ -1,5 +1,6 @@
 //! Hyprland IPC communication and command formatting
 //! Provides functions for communicating with Hyprland via IPC sockets
+//! Optimized for performance with persistent connections and buffer reuse
 
 const std = @import("std");
 const colors = @import("colors.zig");
@@ -8,6 +9,8 @@ pub const HyprlandError = error{
     SocketConnectionFailed,
     CommandSendFailed,
     InvalidSocketPath,
+    ConnectionLost,
+    BufferOverflow,
 };
 
 /// Hyprland IPC socket paths
@@ -28,6 +31,86 @@ pub const HyprlandBorderVars = struct {
     pub const COL_SHADOW_INACTIVE = "decoration:col.shadow_inactive";
 };
 
+/// Buffer size for command formatting (sufficient for border commands)
+pub const COMMAND_BUFFER_SIZE: usize = 256;
+
+/// Persistent connection to Hyprland socket for high-performance updates
+pub const PersistentConnection = struct {
+    socket_path: []const u8,
+    socket: ?std.net.Stream,
+    command_buffer: [COMMAND_BUFFER_SIZE]u8,
+    allocator: std.mem.Allocator,
+
+    pub fn init(allocator: std.mem.Allocator) !PersistentConnection {
+        const socket_path = try getSocketPath(allocator);
+        errdefer allocator.free(socket_path);
+
+        return PersistentConnection{
+            .socket_path = socket_path,
+            .socket = null,
+            .command_buffer = undefined,
+            .allocator = allocator,
+        };
+    }
+
+    pub fn deinit(self: *PersistentConnection) void {
+        if (self.socket) |sock| {
+            sock.close();
+        }
+        self.allocator.free(self.socket_path);
+    }
+
+    pub fn connect(self: *PersistentConnection) !void {
+        if (self.socket != null) return;
+
+        self.socket = std.net.connectUnixSocket(self.socket_path) catch |err| switch (err) {
+            error.ConnectionRefused, error.FileNotFound => return HyprlandError.SocketConnectionFailed,
+            else => return err,
+        };
+    }
+
+    pub fn disconnect(self: *PersistentConnection) void {
+        if (self.socket) |sock| {
+            sock.close();
+            self.socket = null;
+        }
+    }
+
+    pub fn reconnect(self: *PersistentConnection) !void {
+        self.disconnect();
+        try self.connect();
+    }
+
+    pub fn sendCommand(self: *PersistentConnection, command: []const u8) !void {
+        if (self.socket == null) {
+            try self.connect();
+        }
+
+        const sock = self.socket.?;
+        sock.writeAll(command) catch {
+            self.disconnect();
+            return HyprlandError.ConnectionLost;
+        };
+    }
+
+    pub fn sendKeyword(self: *PersistentConnection, variable: []const u8, value: []const u8) !void {
+        const cmd = std.fmt.bufPrint(&self.command_buffer, "keyword {s} {s}\n", .{ variable, value }) catch
+            return HyprlandError.BufferOverflow;
+
+        try self.sendCommand(cmd);
+    }
+
+    pub fn testConnection(self: *PersistentConnection) bool {
+        self.connect() catch return false;
+        const test_cmd = "version\n";
+        self.sendCommand(test_cmd) catch {
+            self.disconnect();
+            return false;
+        };
+        return true;
+    }
+};
+
 /// Get Hyprland socket path using environment variables
 pub fn getSocketPath(allocator: std.mem.Allocator) ![]u8 {
     const runtime = std.process.getEnvVarOwned(allocator, "XDG_RUNTIME_DIR") catch |err| switch (err) {
@@ -45,10 +128,11 @@ pub fn getSocketPath(allocator: std.mem.Allocator) ![]u8 {
     return try std.fmt.allocPrint(allocator, "{s}/hypr/{s}/.socket.sock", .{ runtime, his });
 }
 
-/// Send a keyword command to Hyprland
+/// Send a keyword command to Hyprland (legacy, creates new connection each time)
 pub fn sendKeywordCommand(socket_path: []const u8, variable: []const u8, value: []const u8) !void {
-    const cmd = try std.fmt.allocPrint(std.heap.page_allocator, "keyword {s} {s}\n", .{ variable, value });
-    defer std.heap.page_allocator.free(cmd);
+    var buffer: [COMMAND_BUFFER_SIZE]u8 = undefined;
+    const cmd = std.fmt.bufPrint(&buffer, "keyword {s} {s}\n", .{ variable, value }) catch
+        return HyprlandError.BufferOverflow;
 
     var sock = std.net.connectUnixSocket(socket_path) catch |err| switch (err) {
         error.ConnectionRefused, error.FileNotFound => return HyprlandError.SocketConnectionFailed,
@@ -76,6 +160,23 @@ pub fn updateRainbowBorder(allocator: std.mem.Allocator, socket_path: []const u8
     try sendKeywordCommand(socket_path, HyprlandBorderVars.ACTIVE_BORDER, gradient_value);
 }
 
+/// Update rainbow border using persistent connection (optimized)
+pub fn updateRainbowBorderOptimized(conn: *PersistentConnection, hue: f64) !void {
+    const rgb1 = colors.hsvToRgb(hue, 1.0, 1.0);
+    const rgb2 = colors.hsvToRgb(@mod(hue + 0.5, 1.0), 1.0, 1.0);
+
+    var buffer1: [32]u8 = undefined;
+    var buffer2: [32]u8 = undefined;
+    const c1 = colors.formatHyprlandColorBuf(&buffer1, rgb1[0], rgb1[1], rgb1[2]);
+    const c2 = colors.formatHyprlandColorBuf(&buffer2, rgb2[0], rgb2[1], rgb2[2]);
+
+    var gradient_buffer: [96]u8 = undefined;
+    const gradient_value = std.fmt.bufPrint(&gradient_buffer, "{s} {s} 270deg", .{ c1, c2 }) catch
+        return HyprlandError.BufferOverflow;
+
+    try conn.sendKeyword(HyprlandBorderVars.ACTIVE_BORDER, gradient_value);
+}
+
 /// Update solid color border
 pub fn updateSolidBorder(allocator: std.mem.Allocator, socket_path: []const u8, color: []const u8) !void {
     // Convert hex color to Hyprland format if needed
@@ -97,12 +198,34 @@ pub fn updateSolidBorder(allocator: std.mem.Allocator, socket_path: []const u8, 
     try sendKeywordCommand(socket_path, HyprlandBorderVars.ACTIVE_BORDER, hypr_color);
 }
 
+/// Update solid color border using persistent connection (optimized)
+pub fn updateSolidBorderOptimized(conn: *PersistentConnection, color: []const u8) !void {
+    var buffer: [32]u8 = undefined;
+    const hypr_color: []const u8 = if (color.len == 7 and color[0] == '#')
+        std.fmt.bufPrint(&buffer, "0xff{s}", .{color[1..]}) catch return HyprlandError.BufferOverflow
+    else if (std.mem.startsWith(u8, color, "0x"))
+        color
+    else
+        std.fmt.bufPrint(&buffer, "0xff{s}", .{color}) catch return HyprlandError.BufferOverflow;
+
+    try conn.sendKeyword(HyprlandBorderVars.ACTIVE_BORDER, hypr_color);
+}
+
 /// Update gradient border with two colors and angle
 pub fn updateGradientBorder(allocator: std.mem.Allocator, socket_path: []const u8, color1: []const u8, color2: []const u8, angle: u32) !void {
     const gradient_value = try std.fmt.allocPrint(allocator, "{s} {s} {d}deg", .{ color1, color2, angle });
     defer allocator.free(gradient_value);
 
     try sendKeywordCommand(socket_path, HyprlandBorderVars.ACTIVE_BORDER, gradient_value);
+}
+
+/// Update gradient border using persistent connection (optimized)
+pub fn updateGradientBorderOptimized(conn: *PersistentConnection, color1: []const u8, color2: []const u8, angle: u32) !void {
+    var buffer: [96]u8 = undefined;
+    const gradient_value = std.fmt.bufPrint(&buffer, "{s} {s} {d}deg", .{ color1, color2, angle }) catch
+        return HyprlandError.BufferOverflow;
+
+    try conn.sendKeyword(HyprlandBorderVars.ACTIVE_BORDER, gradient_value);
 }
 
 /// Update border with multiple gradient colors

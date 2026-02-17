@@ -1,20 +1,26 @@
 //! Rainbow animation provider
 //! Refactored from the original core animation logic
+//! Optimized for performance with persistent connection and zero-allocation updates
 
 const std = @import("std");
 const config = @import("config");
 const utils = @import("utils");
 const AnimationProvider = @import("mod.zig").AnimationProvider;
 
-const RainbowAnimation = struct {
+pub const RainbowAnimation = struct {
     hue: f64 = 0.0,
     speed: f64 = 0.01,
     direction: config.AnimationDirection = .clockwise,
+    connection: ?utils.hyprland.PersistentConnection = null,
 
     pub fn update(self: *RainbowAnimation, allocator: std.mem.Allocator, socket_path: []const u8, time: f64) !void {
-        _ = time; // Time parameter not used in rainbow animation
+        _ = time;
 
-        try utils.hyprland.updateRainbowBorder(allocator, socket_path, self.hue);
+        if (self.connection) |*conn| {
+            try utils.hyprland.updateRainbowBorderOptimized(conn, self.hue);
+        } else {
+            try utils.hyprland.updateRainbowBorder(allocator, socket_path, self.hue);
+        }
 
         const step = if (self.direction == .clockwise) self.speed else -self.speed;
         self.hue = @mod(self.hue + step, 1.0);
@@ -26,7 +32,17 @@ const RainbowAnimation = struct {
     }
 
     pub fn cleanup(self: *RainbowAnimation) void {
-        _ = self; // Nothing to cleanup for rainbow animation
+        if (self.connection) |*conn| {
+            conn.deinit();
+            self.connection = null;
+        }
+    }
+
+    pub fn enableOptimized(self: *RainbowAnimation, allocator: std.mem.Allocator) !void {
+        if (self.connection == null) {
+            self.connection = try utils.hyprland.PersistentConnection.init(allocator);
+            try self.connection.?.connect();
+        }
     }
 };
 

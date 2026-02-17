@@ -1,17 +1,20 @@
 //! Solid color animation provider
 //! Provides static border colors without animation
+//! Optimized with persistent connection and minimal updates
 
 const std = @import("std");
 const config = @import("config");
 const utils = @import("utils");
 const AnimationProvider = @import("mod.zig").AnimationProvider;
 
-const SolidAnimation = struct {
+pub const SolidAnimation = struct {
     colors: std.ArrayList(config.ColorFormat),
     current_color_index: usize = 0,
     allocator: std.mem.Allocator,
-    last_applied_color: ?[]const u8 = null,
+    last_applied_color: [7]u8 = [_]u8{0} ** 7,
+    last_applied_len: usize = 0,
     border_set: bool = false,
+    connection: ?utils.hyprland.PersistentConnection = null,
 
     pub fn init(allocator: std.mem.Allocator) SolidAnimation {
         return SolidAnimation{
@@ -21,63 +24,55 @@ const SolidAnimation = struct {
     }
 
     pub fn update(self: *SolidAnimation, allocator: std.mem.Allocator, socket_path: []const u8, time: f64) !void {
-        _ = time; // Time parameter not used for solid colors
+        _ = time;
 
+        var target_buffer: [7]u8 = undefined;
         var target_color: []const u8 = undefined;
-        var should_free_target = false;
 
         if (self.colors.items.len == 0) {
-            // Default to white if no colors configured
             target_color = "#ffffff";
         } else {
             const color = self.colors.items[self.current_color_index];
-            target_color = try color.toHex(allocator);
-            should_free_target = true;
+            const hex = try color.toHex(allocator);
+            defer allocator.free(hex);
+            @memcpy(target_buffer[0..hex.len], hex);
+            target_color = target_buffer[0..hex.len];
         }
-        defer if (should_free_target) allocator.free(target_color);
 
-        // Only update if color changed or not set yet
-        const should_update = if (self.last_applied_color) |last_color|
-            !std.mem.eql(u8, last_color, target_color)
+        const should_update = if (self.last_applied_len > 0)
+            !std.mem.eql(u8, self.last_applied_color[0..self.last_applied_len], target_color)
         else
             true;
 
         if (should_update) {
-            // Convert to Hyprland format
-            const hypr_color = try convertToHyprlandColor(allocator, target_color);
-            defer allocator.free(hypr_color);
-
-            try utils.hyprland.updateSolidBorder(allocator, socket_path, hypr_color);
-
-            // Update last applied color
-            if (self.last_applied_color) |old_color| {
-                allocator.free(old_color);
+            if (self.connection) |*conn| {
+                try utils.hyprland.updateSolidBorderOptimized(conn, target_color);
+            } else {
+                try utils.hyprland.updateSolidBorder(allocator, socket_path, target_color);
             }
-            self.last_applied_color = try allocator.dupe(u8, target_color);
+
+            @memcpy(self.last_applied_color[0..target_color.len], target_color);
+            self.last_applied_len = target_color.len;
             self.border_set = true;
         }
     }
 
     pub fn configure(self: *SolidAnimation, animation_config: config.AnimationConfig) !void {
-        // Clear existing colors and copy new ones
         self.colors.clearAndFree(self.allocator);
         for (animation_config.colors.items) |color| {
             try self.colors.append(self.allocator, color);
         }
 
-        // Reset to first color and force update
         self.current_color_index = 0;
-        if (self.last_applied_color) |old_color| {
-            self.allocator.free(old_color);
-            self.last_applied_color = null;
-        }
+        self.last_applied_len = 0;
         self.border_set = false;
     }
 
     pub fn cleanup(self: *SolidAnimation) void {
         self.colors.deinit(self.allocator);
-        if (self.last_applied_color) |color| {
-            self.allocator.free(color);
+        if (self.connection) |*conn| {
+            conn.deinit();
+            self.connection = null;
         }
     }
 
@@ -87,12 +82,11 @@ const SolidAnimation = struct {
         }
     }
 
-    fn convertToHyprlandColor(allocator: std.mem.Allocator, hex_color: []const u8) ![]u8 {
-        if (hex_color.len != 7 or hex_color[0] != '#') {
-            return try std.fmt.allocPrint(allocator, "0xff{s}", .{hex_color});
+    pub fn enableOptimized(self: *SolidAnimation, allocator: std.mem.Allocator) !void {
+        if (self.connection == null) {
+            self.connection = try utils.hyprland.PersistentConnection.init(allocator);
+            try self.connection.?.connect();
         }
-
-        return try std.fmt.allocPrint(allocator, "0xff{s}", .{hex_color[1..]});
     }
 };
 

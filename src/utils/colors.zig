@@ -116,6 +116,11 @@ pub fn formatHyprlandColor(allocator: std.mem.Allocator, r: u8, g: u8, b: u8) ![
     return try std.fmt.allocPrint(allocator, "0xff{X:0>2}{X:0>2}{X:0>2}", .{ r, g, b });
 }
 
+/// Format RGB values as Hyprland color string into provided buffer (zero-allocation)
+pub fn formatHyprlandColorBuf(buffer: []u8, r: u8, g: u8, b: u8) []u8 {
+    return std.fmt.bufPrint(buffer, "0xff{X:0>2}{X:0>2}{X:0>2}", .{ r, g, b }) catch buffer[0..0];
+}
+
 /// Parse RGB color string "r,g,b" to RGB values
 pub fn parseRgbColor(rgb_str: []const u8) ColorError![3]u8 {
     var parts = std.mem.splitSequence(u8, rgb_str, ",");

@@ -92,7 +92,6 @@ fn runWithSavedConfig(allocator: std.mem.Allocator) !void {
     std.debug.print("Starting border animation with {s} type at {d} FPS...\n", .{ animation_config.animation_type.toString(), animation_config.fps });
     std.debug.print("Press Ctrl+C to stop.\n", .{});
 
-    // Create and run animation
     var animation_provider = @import("animations").createAnimationProvider(allocator, animation_config.animation_type) catch |err| {
         std.debug.print("Error creating animation provider: {s}\n", .{@errorName(err)});
         return;
@@ -101,22 +100,46 @@ fn runWithSavedConfig(allocator: std.mem.Allocator) !void {
 
     try animation_provider.configure(animation_config);
 
-    // Animation loop
+    try animation_provider.enableOptimized(allocator);
+
     var timer = try std.time.Timer.start();
     const safe_fps = if (animation_config.fps >= 1) animation_config.fps else 1;
     const frame_time_ns = std.time.ns_per_s / safe_fps;
 
+    var accumulated_error: i64 = 0;
+
     while (true) {
-        const elapsed = @as(f64, @floatFromInt(timer.lap())) / std.time.ns_per_s;
+        const frame_start = timer.lap();
+        const elapsed = @as(f64, @floatFromInt(frame_start)) / std.time.ns_per_s;
 
         animation_provider.update(allocator, socket_path, elapsed) catch |err| {
             std.debug.print("Animation error: {s}\n", .{@errorName(err)});
             std.debug.print("Retrying in 1 second...\n", .{});
             std.Thread.sleep(std.time.ns_per_s);
+            accumulated_error = 0;
             continue;
         };
 
-        std.Thread.sleep(frame_time_ns);
+        const frame_end = timer.read();
+        const frame_elapsed = frame_end - frame_start;
+        const target_sleep = frame_time_ns -| frame_elapsed;
+
+        const adjusted_sleep: u64 = if (accumulated_error < 0)
+            target_sleep + @as(u64, @intCast(-accumulated_error))
+        else
+            target_sleep -| @as(u64, @intCast(accumulated_error));
+        if (adjusted_sleep > 0) {
+            std.Thread.sleep(adjusted_sleep);
+        }
+
+        const actual_frame_time = timer.read() - frame_start;
+        accumulated_error = @as(i64, @intCast(actual_frame_time)) - @as(i64, @intCast(frame_time_ns));
+
+        if (accumulated_error > @as(i64, @intCast(frame_time_ns)) * 2) {
+            accumulated_error = @as(i64, @intCast(frame_time_ns)) * 2;
+        } else if (accumulated_error < -@as(i64, @intCast(frame_time_ns)) * 2) {
+            accumulated_error = -@as(i64, @intCast(frame_time_ns)) * 2;
+        }
     }
 }
 
